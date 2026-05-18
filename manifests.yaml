@@ -1,0 +1,175 @@
+# ============================================================
+# k8s/deployment-stable.yaml
+# Stable (production) deployment - receives 90% traffic
+# ============================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: devsecops-app-stable
+  namespace: production
+  labels:
+    app: devsecops-app
+    track: stable
+    version: "1.0.0"
+spec:
+  replicas: 9          # 90% of traffic weight
+  selector:
+    matchLabels:
+      app: devsecops-app
+      track: stable
+  template:
+    metadata:
+      labels:
+        app: devsecops-app
+        track: stable
+    spec:
+      containers:
+      - name: app
+        image: $(ACR_NAME).azurecr.io/devsecops-app:stable
+        ports:
+        - containerPort: 3000
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "128Mi"
+          limits:
+            cpu: "500m"
+            memory: "256Mi"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 3000
+          initialDelaySeconds: 10
+          periodSeconds: 15
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 3000
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        env:
+        - name: NODE_ENV
+          value: "production"
+        - name: PORT
+          value: "3000"
+        - name: DB_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: app-secrets
+              key: db-password
+---
+# ============================================================
+# k8s/deployment-canary.yaml
+# Canary deployment - receives 10% traffic initially
+# ============================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: devsecops-app-canary
+  namespace: production
+  labels:
+    app: devsecops-app
+    track: canary
+    version: "$(BUILD_VERSION)"
+spec:
+  replicas: 1          # 10% traffic weight (1 out of 10 total pods)
+  selector:
+    matchLabels:
+      app: devsecops-app
+      track: canary
+  template:
+    metadata:
+      labels:
+        app: devsecops-app
+        track: canary
+    spec:
+      containers:
+      - name: app
+        image: $(ACR_NAME).azurecr.io/devsecops-app:$(BUILD_VERSION)
+        ports:
+        - containerPort: 3000
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "128Mi"
+          limits:
+            cpu: "500m"
+            memory: "256Mi"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 3000
+          initialDelaySeconds: 10
+          periodSeconds: 15
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 3000
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        env:
+        - name: NODE_ENV
+          value: "production"
+        - name: PORT
+          value: "3000"
+        - name: DB_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: app-secrets
+              key: db-password
+---
+# ============================================================
+# k8s/service.yaml
+# Single service routes to BOTH stable + canary pods
+# Kubernetes native load balancing splits traffic by pod ratio
+# ============================================================
+apiVersion: v1
+kind: Service
+metadata:
+  name: devsecops-app-svc
+  namespace: production
+spec:
+  selector:
+    app: devsecops-app   # Matches BOTH stable and canary pods
+  ports:
+  - port: 80
+    targetPort: 3000
+  type: ClusterIP
+---
+# ============================================================
+# k8s/ingress.yaml
+# NGINX Ingress with canary annotation (header-based routing)
+# ============================================================
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: devsecops-app-ingress
+  namespace: production
+  annotations:
+    kubernetes.io/ingress.class: nginx
+    nginx.ingress.kubernetes.io/canary: "true"
+    nginx.ingress.kubernetes.io/canary-weight: "10"
+spec:
+  rules:
+  - host: devsecops-app.yourdomain.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: devsecops-app-svc
+            port:
+              number: 80
+---
+# ============================================================
+# k8s/secrets.yaml (Reference only - use Azure Key Vault in prod)
+# ============================================================
+apiVersion: v1
+kind: Secret
+metadata:
+  name: app-secrets
+  namespace: production
+type: Opaque
+data:
+  db-password: BASE64_ENCODED_VALUE_FROM_KEYVAULT
