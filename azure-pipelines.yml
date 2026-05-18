@@ -35,7 +35,20 @@ stages:
             displayName: 'npm audit'
             continueOnError: true
 
+          - task: dependency-check-build-task@6
+            inputs:
+              projectName: 'devsecops-app'
+              scanPath: '$(Build.SourcesDirectory)'
+              format: 'HTML, JSON, JUNIT'
+              uploadReports: true
 
+          # Publish SCA results as artifacts
+          - task: PublishBuildArtifacts@1
+            inputs:
+              PathtoPublish: '$(Build.ArtifactStagingDirectory)'
+              ArtifactName: 'sca-reports'
+              publishLocation: 'Container'
+            condition: always()
 
               
 
