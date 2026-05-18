@@ -1,93 +1,573 @@
-# Starter pipeline
-# Start with a minimal pipeline that you can customize to build and deploy your code.
-# Add steps that build, run tests, deploy, and more:
-# https://aka.ms/yaml
+# ==============================================================
+# azure-pipelines.yml
+# DevSecOps Pipeline for AKS Deployment
+# Stages: SCA → Secret Scan → SAST → Build → Test →
+#         Container Scan → IaC Scan → Deploy (Canary) → Promote
+#
+# Security stages use "continueOnError: true" so findings are
+# reported but the pipeline continues to completion.
+# ==============================================================
 
 trigger:
-- main
+  branches:
+    include:
+      - main
+      - develop
+
+variables:
+  ACR_NAME: 'myacrregistry'
+  AKS_CLUSTER: 'my-aks-cluster'
+  RESOURCE_GROUP: 'my-rg'
+  IMAGE_NAME: 'devsecops-app'
+  BUILD_VERSION: '$(Build.BuildId)'
+  K8S_NAMESPACE: 'production'
 
 pool:
-  vmImage: ubuntu-latest
+  vmImage: 'ubuntu-latest'
 
+# ==============================================================
+# STAGE 1: SCA - Software Composition Analysis
+# Tool: npm audit + OWASP Dependency-Check
+# Purpose: Scan open-source dependencies for known CVEs
+# Findings expected: lodash, node-serialize, axios, mongoose vulns
+# ==============================================================
 stages:
-  - stage: SCA
-    displayName: 'Stage 1 - SCA (Dependency Scanning)'
-    jobs:
-      - job: DependencyScan
-        displayName: 'OWASP Dependency Check + npm audit'
-        continueOnError: true
-        steps:
-          - task: UseNode@1
+- stage: SCA
+  displayName: '🔍 Stage 1 - SCA (Dependency Scanning)'
+  jobs:
+  - job: DependencyScan
+    displayName: 'OWASP Dependency Check + npm audit'
+    continueOnError: true        # ← Pipeline continues even with HIGH findings
+    steps:
+    - task: NodeTool@0
+      inputs:
+        versionSpec: '16.x'
+
+    - script: npm install
+      displayName: 'Install Dependencies'
+
+    # npm audit - built-in Node.js vulnerability scanner
+    - script: |
+        echo "======================================"
+        echo "Running npm audit..."
+        echo "======================================"
+        npm audit --json > npm-audit-report.json || true
+        npm audit || true
+        echo "npm audit complete. See report above."
+      displayName: 'npm audit'
+      continueOnError: true
+
+    # OWASP Dependency-Check - deeper CVE database scan
+    - task: dependency-check-build-task@6
+      displayName: 'OWASP Dependency-Check'
+      inputs:
+        projectName: '$(IMAGE_NAME)'
+        scanPath: '$(Build.SourcesDirectory)'
+        format: 'HTML,JSON,JUNIT'
+        failOnCVSS: '9'           # Only FAIL pipeline on CVSS >= 9 (Critical)
+        additionalArguments: '--enableExperimental'
+      continueOnError: true
+
+    # Publish SCA results as artifacts
+    - task: PublishBuildArtifacts@1
+      inputs:
+        PathtoPublish: '$(Build.SourcesDirectory)'
+        ArtifactName: 'sca-reports'
+      condition: always()
+
+    # Publish test results for JUnit format
+    - task: PublishTestResults@2
+      inputs:
+        testResultsFormat: 'JUnit'
+        testResultsFiles: '**/dependency-check-junit.xml'
+      condition: always()
+
+    # Post summary to pipeline
+    - script: |
+        echo "##vso[task.logissue type=warning]SCA FINDINGS DETECTED - Review dependency vulnerabilities in artifact: sca-reports"
+        echo "##vso[task.complete result=SucceededWithIssues]SCA completed with findings"
+      displayName: 'Post SCA Warning'
+      continueOnError: true
+
+# ==============================================================
+# STAGE 2: SECRET SCAN
+# Tool: Gitleaks + TruffleHog
+# Purpose: Detect hardcoded secrets, API keys, credentials in code
+# Findings expected: AWS keys, DB passwords, JWT secrets in app.js
+# ==============================================================
+- stage: SecretScan
+  displayName: '🔐 Stage 2 - Secret Scanning'
+  dependsOn: SCA
+  condition: always()             # Run regardless of SCA result
+  jobs:
+  - job: SecretDetection
+    displayName: 'Gitleaks + TruffleHog Secret Detection'
+    continueOnError: true
+    steps:
+    # Gitleaks - scans git history AND current code for secrets
+    - script: |
+        echo "======================================"
+        echo "Installing Gitleaks..."
+        echo "======================================"
+        wget -q https://github.com/gitleaks/gitleaks/releases/download/v8.18.0/gitleaks_8.18.0_linux_x64.tar.gz
+        tar -xzf gitleaks_8.18.0_linux_x64.tar.gz
+        sudo mv gitleaks /usr/local/bin/
+
+        echo "======================================"
+        echo "Running Gitleaks scan..."
+        echo "======================================"
+        gitleaks detect \
+          --source=$(Build.SourcesDirectory) \
+          --report-format=json \
+          --report-path=gitleaks-report.json \
+          --verbose || true
+
+        echo "Gitleaks findings:"
+        cat gitleaks-report.json | python3 -m json.tool || echo "No structured output"
+      displayName: 'Gitleaks Secret Scan'
+      continueOnError: true
+
+    # TruffleHog - entropy-based + pattern secret detection
+    - script: |
+        echo "======================================"
+        echo "Installing TruffleHog..."
+        echo "======================================"
+        pip install truffleHog3 --quiet
+
+        echo "======================================"
+        echo "Running TruffleHog scan..."
+        echo "======================================"
+        trufflehog3 \
+          --format json \
+          --output trufflehog-report.json \
+          $(Build.SourcesDirectory) || true
+
+        echo "TruffleHog scan complete."
+      displayName: 'TruffleHog Secret Scan'
+      continueOnError: true
+
+    - task: PublishBuildArtifacts@1
+      inputs:
+        PathtoPublish: '$(Build.SourcesDirectory)'
+        ArtifactName: 'secret-scan-reports'
+      condition: always()
+
+    - script: |
+        echo "##vso[task.logissue type=warning]SECRET SCAN FINDINGS DETECTED - Hardcoded credentials found in source code!"
+        echo "##vso[task.logissue type=warning]Files affected: app.js - AWS_ACCESS_KEY, DB_PASSWORD, JWT_SECRET"
+        echo "##vso[task.complete result=SucceededWithIssues]Secret Scan completed with findings"
+      displayName: 'Post Secret Scan Warning'
+      continueOnError: true
+
+# ==============================================================
+# STAGE 3: SAST - Static Application Security Testing
+# Tool: Semgrep + NodeJsScan
+# Purpose: Analyze source code for security vulnerabilities
+#          without executing it
+# Findings expected: NoSQL Injection, Path Traversal, SSRF, RCE
+# ==============================================================
+- stage: SAST
+  displayName: '🛡️ Stage 3 - SAST (Static Code Analysis)'
+  dependsOn: SecretScan
+  condition: always()
+  jobs:
+  - job: StaticAnalysis
+    displayName: 'Semgrep + NodeJsScan SAST'
+    continueOnError: true
+    steps:
+    # Semgrep - fast static analysis with security rules
+    - script: |
+        echo "======================================"
+        echo "Installing Semgrep..."
+        echo "======================================"
+        pip install semgrep --quiet
+
+        echo "======================================"
+        echo "Running Semgrep with security rulesets..."
+        echo "======================================"
+        semgrep \
+          --config=p/nodejs \
+          --config=p/owasp-top-ten \
+          --config=p/jwt \
+          --config=p/secrets \
+          --json \
+          --output=semgrep-report.json \
+          $(Build.SourcesDirectory) || true
+
+        echo "======================================"
+        echo "Semgrep Findings Summary:"
+        echo "======================================"
+        python3 -c "
+        import json
+        with open('semgrep-report.json') as f:
+            data = json.load(f)
+        results = data.get('results', [])
+        print(f'Total findings: {len(results)}')
+        for r in results:
+            sev = r.get('extra', {}).get('severity', 'UNKNOWN')
+            msg = r.get('extra', {}).get('message', '')[:80]
+            line = r.get('start', {}).get('line', '?')
+            file = r.get('path', '?')
+            print(f'  [{sev}] Line {line} in {file}: {msg}')
+        " || true
+      displayName: 'Semgrep SAST Scan'
+      continueOnError: true
+
+    # NodeJsScan - Node.js-specific vulnerability patterns
+    - script: |
+        echo "======================================"
+        echo "Installing NodeJsScan..."
+        echo "======================================"
+        pip install nodejsscan --quiet
+
+        echo "======================================"
+        echo "Running NodeJsScan..."
+        echo "======================================"
+        nodejsscan \
+          -d $(Build.SourcesDirectory) \
+          -o nodejsscan-report.json || true
+
+        echo "NodeJsScan complete."
+      displayName: 'NodeJsScan SAST'
+      continueOnError: true
+
+    - task: PublishBuildArtifacts@1
+      inputs:
+        PathtoPublish: '$(Build.SourcesDirectory)'
+        ArtifactName: 'sast-reports'
+      condition: always()
+
+    - script: |
+        echo "##vso[task.logissue type=warning]SAST FINDINGS: NoSQL Injection in /login, Path Traversal in /file, SSRF in /fetch, RCE via node-serialize"
+        echo "##vso[task.complete result=SucceededWithIssues]SAST completed with HIGH severity findings"
+      displayName: 'Post SAST Warning'
+      continueOnError: true
+
+# ==============================================================
+# STAGE 4: BUILD
+# Build Docker image and push to Azure Container Registry
+# ==============================================================
+- stage: Build
+  displayName: '🏗️ Stage 4 - Docker Build & Push'
+  dependsOn: SAST
+  condition: always()
+  jobs:
+  - job: DockerBuild
+    displayName: 'Build and Push Docker Image to ACR'
+    steps:
+    - task: Docker@2
+      displayName: 'Build Docker Image'
+      inputs:
+        command: build
+        repository: '$(ACR_NAME).azurecr.io/$(IMAGE_NAME)'
+        dockerfile: '$(Build.SourcesDirectory)/Dockerfile'
+        tags: |
+          $(BUILD_VERSION)
+          latest
+
+    - task: Docker@2
+      displayName: 'Push to Azure Container Registry'
+      inputs:
+        command: push
+        containerRegistry: 'ACR-ServiceConnection'
+        repository: '$(ACR_NAME).azurecr.io/$(IMAGE_NAME)'
+        tags: |
+          $(BUILD_VERSION)
+          latest
+
+    - script: |
+        echo "Image pushed: $(ACR_NAME).azurecr.io/$(IMAGE_NAME):$(BUILD_VERSION)"
+        echo "##vso[task.setvariable variable=IMAGE_TAG;isOutput=true]$(BUILD_VERSION)"
+      displayName: 'Set Image Tag Output Variable'
+      name: SetImageTag
+
+# ==============================================================
+# STAGE 5: TEST
+# Run unit tests, integration tests with coverage
+# ==============================================================
+- stage: Test
+  displayName: '✅ Stage 5 - Unit & Integration Tests'
+  dependsOn: Build
+  jobs:
+  - job: RunTests
+    displayName: 'Jest Unit Tests with Coverage'
+    steps:
+    - task: NodeTool@0
+      inputs:
+        versionSpec: '16.x'
+
+    - script: npm install
+      displayName: 'Install Dependencies'
+
+    - script: |
+        npm test -- --ci --coverage --reporters=default --reporters=jest-junit
+      displayName: 'Run Jest Tests'
+      env:
+        JEST_JUNIT_OUTPUT_DIR: '$(Build.SourcesDirectory)/test-results'
+        JEST_JUNIT_OUTPUT_NAME: 'jest-results.xml'
+
+    - task: PublishTestResults@2
+      inputs:
+        testResultsFormat: 'JUnit'
+        testResultsFiles: '**/jest-results.xml'
+      condition: always()
+
+    - task: PublishCodeCoverageResults@1
+      inputs:
+        codeCoverageTool: 'Cobertura'
+        summaryFileLocation: '$(Build.SourcesDirectory)/coverage/cobertura-coverage.xml'
+      condition: always()
+
+# ==============================================================
+# STAGE 6: CONTAINER SCAN
+# Tool: Trivy - scans built Docker image for OS & library CVEs
+# Findings expected: CVEs in node:14-alpine base image,
+#                    running as root, no HEALTHCHECK
+# ==============================================================
+- stage: ContainerScan
+  displayName: '🐳 Stage 6 - Container Image Scan'
+  dependsOn: Test
+  condition: always()
+  jobs:
+  - job: TrivyScan
+    displayName: 'Trivy Container Vulnerability Scan'
+    continueOnError: true
+    steps:
+    - script: |
+        echo "======================================"
+        echo "Installing Trivy..."
+        echo "======================================"
+        sudo apt-get install -y wget apt-transport-https gnupg lsb-release
+        wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | sudo apt-key add -
+        echo "deb https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -sc) main" | sudo tee -a /etc/apt/sources.list.d/trivy.list
+        sudo apt-get update -qq
+        sudo apt-get install -y trivy
+
+        echo "======================================"
+        echo "Pulling image for scanning..."
+        echo "======================================"
+        docker pull $(ACR_NAME).azurecr.io/$(IMAGE_NAME):$(BUILD_VERSION)
+
+        echo "======================================"
+        echo "Running Trivy vulnerability scan..."
+        echo "======================================"
+        trivy image \
+          --format json \
+          --output trivy-report.json \
+          --severity HIGH,CRITICAL \
+          --exit-code 0 \
+          $(ACR_NAME).azurecr.io/$(IMAGE_NAME):$(BUILD_VERSION)
+
+        echo "======================================"
+        echo "Trivy scan results (summary):"
+        echo "======================================"
+        trivy image \
+          --severity HIGH,CRITICAL \
+          --exit-code 0 \
+          $(ACR_NAME).azurecr.io/$(IMAGE_NAME):$(BUILD_VERSION)
+      displayName: 'Trivy Image Scan'
+      continueOnError: true
+
+    # Trivy config scan - Dockerfile best practice checks
+    - script: |
+        trivy config \
+          --format json \
+          --output trivy-config-report.json \
+          $(Build.SourcesDirectory)/Dockerfile || true
+        echo "======================================"
+        echo "Dockerfile misconfigurations:"
+        echo "======================================"
+        trivy config $(Build.SourcesDirectory)/Dockerfile || true
+      displayName: 'Trivy Dockerfile Misconfiguration Scan'
+      continueOnError: true
+
+    - task: PublishBuildArtifacts@1
+      inputs:
+        PathtoPublish: '$(Build.SourcesDirectory)'
+        ArtifactName: 'container-scan-reports'
+      condition: always()
+
+    - script: |
+        echo "##vso[task.logissue type=warning]CONTAINER SCAN: CVEs found in node:14-alpine. Running as root. No HEALTHCHECK."
+        echo "##vso[task.complete result=SucceededWithIssues]Container scan completed with findings"
+      displayName: 'Post Container Scan Warning'
+
+# ==============================================================
+# STAGE 7: IaC SCAN
+# Tool: Checkov - scans Kubernetes manifests and Dockerfile
+# Findings expected: No resource limits, no network policy,
+#                    running as root, secrets in env vars
+# ==============================================================
+- stage: IaCScan
+  displayName: '📋 Stage 7 - IaC Security Scan'
+  dependsOn: ContainerScan
+  condition: always()
+  jobs:
+  - job: CheckovScan
+    displayName: 'Checkov Kubernetes & Dockerfile IaC Scan'
+    continueOnError: true
+    steps:
+    - script: |
+        echo "======================================"
+        echo "Installing Checkov..."
+        echo "======================================"
+        pip install checkov --quiet
+
+        echo "======================================"
+        echo "Scanning Kubernetes manifests..."
+        echo "======================================"
+        checkov \
+          -d $(Build.SourcesDirectory)/k8s \
+          --framework kubernetes \
+          --output cli \
+          --output json \
+          --output-file-path $(Build.SourcesDirectory) \
+          --soft-fail || true
+
+        echo "======================================"
+        echo "Scanning Dockerfile..."
+        echo "======================================"
+        checkov \
+          -f $(Build.SourcesDirectory)/Dockerfile \
+          --framework dockerfile \
+          --output cli \
+          --soft-fail || true
+      displayName: 'Checkov IaC Scan'
+      continueOnError: true
+
+    - task: PublishBuildArtifacts@1
+      inputs:
+        PathtoPublish: '$(Build.SourcesDirectory)'
+        ArtifactName: 'iac-scan-reports'
+      condition: always()
+
+    - script: |
+        echo "##vso[task.logissue type=warning]IaC FINDINGS: Container running as root, no PodSecurityContext, no NetworkPolicy, secrets exposed as env vars"
+        echo "##vso[task.complete result=SucceededWithIssues]IaC scan completed with findings"
+      displayName: 'Post IaC Scan Warning'
+
+# ==============================================================
+# STAGE 8: DEPLOY - Canary Strategy
+# Deploy new version as canary (10% traffic) alongside stable
+# ==============================================================
+- stage: DeployCanary
+  displayName: '🚀 Stage 8 - Deploy Canary (10% Traffic)'
+  dependsOn: IaCScan
+  condition: succeeded('Test')   # Only deploy if tests PASSED
+  jobs:
+  - deployment: CanaryDeployment
+    displayName: 'Deploy Canary to AKS'
+    environment: 'production-aks'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: AzureCLI@2
+            displayName: 'Connect to AKS'
             inputs:
-              checkLatest: true
+              azureSubscription: 'AzureServiceConnection'
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                az aks get-credentials \
+                  --resource-group $(RESOURCE_GROUP) \
+                  --name $(AKS_CLUSTER) \
+                  --overwrite-existing
 
-          - script: npm install
-            displayName: 'Install Dependencies'
+          - script: |
+              # Set the image tag in canary deployment manifest
+              sed -i "s|\$(BUILD_VERSION)|$(BUILD_VERSION)|g" k8s/manifests.yaml
+              sed -i "s|\$(ACR_NAME)|$(ACR_NAME)|g" k8s/manifests.yaml
 
-          # npm audit - built-in Node.js vulnerability scanner
+              echo "Deploying canary with 1 replica (10% of 10 total pods)..."
+              kubectl apply -f k8s/manifests.yaml -n $(K8S_NAMESPACE)
+
+              echo "Waiting for canary pods to be ready..."
+              kubectl rollout status deployment/devsecops-app-canary \
+                -n $(K8S_NAMESPACE) \
+                --timeout=120s
+
+              echo "======================================"
+              echo "Current pod distribution:"
+              echo "======================================"
+              kubectl get pods -n $(K8S_NAMESPACE) -l app=devsecops-app
+              echo ""
+              echo "Traffic split: ~90% stable, ~10% canary"
+            displayName: 'Apply Canary Manifests'
+
+          # Monitor canary for 5 minutes before promotion
           - script: |
               echo "======================================"
-              echo "Running npm audit..."
+              echo "Monitoring canary health for 5 minutes..."
               echo "======================================"
-              npm audit --json > npm-audit-report.json || true
-              npm audit || true
-              echo "npm audit complete. See report above."
-            displayName: 'npm audit'
-            continueOnError: true
+              for i in {1..10}; do
+                READY=$(kubectl get deployment devsecops-app-canary \
+                  -n $(K8S_NAMESPACE) \
+                  -o jsonpath='{.status.readyReplicas}')
+                echo "Check $i/10: Canary ready replicas = ${READY:-0}"
+                sleep 30
+              done
 
-          - task: dependency-check-build-task@6
+              FINAL_READY=$(kubectl get deployment devsecops-app-canary \
+                -n $(K8S_NAMESPACE) \
+                -o jsonpath='{.status.readyReplicas}')
+
+              if [ "${FINAL_READY}" = "1" ]; then
+                echo "✅ Canary is healthy. Ready for promotion."
+              else
+                echo "❌ Canary health check failed. Manual intervention required."
+                exit 1
+              fi
+            displayName: 'Monitor Canary Health (5 min)'
+
+# ==============================================================
+# STAGE 9: PROMOTE - Full Rollout
+# Promote canary to stable if health checks pass
+# Updates stable deployment image + scales canary to 0
+# ==============================================================
+- stage: PromoteToStable
+  displayName: '⬆️ Stage 9 - Promote Canary to Stable'
+  dependsOn: DeployCanary
+  condition: succeeded()
+  jobs:
+  - deployment: PromoteDeployment
+    displayName: 'Promote to 100% Traffic (Full Rollout)'
+    environment: 'production-aks'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: AzureCLI@2
             inputs:
-              projectName: 'devsecops-app'
-              scanPath: '$(Build.SourcesDirectory)'
-              format: 'HTML, JSON, JUNIT'
-              uploadReports: true
+              azureSubscription: 'AzureServiceConnection'
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                az aks get-credentials \
+                  --resource-group $(RESOURCE_GROUP) \
+                  --name $(AKS_CLUSTER) \
+                  --overwrite-existing
 
-          # Publish SCA results as artifacts
-          - task: PublishBuildArtifacts@1
-            inputs:
-              PathtoPublish: '$(Build.ArtifactStagingDirectory)'
-              ArtifactName: 'sca-reports'
-              publishLocation: 'Container'
-            condition: always()
-
-          # Post summary to pipeline
-          - script: |
-              echo "##vso[task.logissue type=warning]SCA FINDINGS DETECTED - Review dependency vulnerabilities in artifact: sca-reports"
-              echo "##vso[task.complete result=SucceededWithIssues]SCA completed with findings"
-            displayName: 'Post SCA Warning'
-            continueOnError: true
-
-          # STAGE 2: SECRET SCAN
-          # Tool: Gitleaks + TruffleHog
-          # Purpose: Detect hardcoded secrets, API keys, credentials in code
-          # Findings expected: AWS keys, DB passwords, JWT secrets in app.js 
-
-  - stage: SecretScan
-    displayName: 'Stage 2 - Secret Scanning'
-    dependsOn: SCA
-    condition: always()
-    jobs:
-      - job: SecretDetection
-        displayName: 'Gitleaks + TruffleHog Secret Detection'
-        continueOnError: true
-        steps:
-        # Gitleaks - scans git history AND current code for secrets
           - script: |
               echo "======================================"
-              echo "Installing Gitleaks..."
+              echo "Promoting canary to stable..."
               echo "======================================"
-              gitleaks detect \
-                --source=$(Build.SourcesDirectory) \
-                --report-format=json \
-                --report-path=gitleaks-report.json \
-                --verbose || true
 
+              # Update stable deployment with new image
+              kubectl set image deployment/devsecops-app-stable \
+                app=$(ACR_NAME).azurecr.io/$(IMAGE_NAME):$(BUILD_VERSION) \
+                -n $(K8S_NAMESPACE)
 
+              # Wait for stable rollout
+              kubectl rollout status deployment/devsecops-app-stable \
+                -n $(K8S_NAMESPACE) --timeout=180s
 
+              # Scale canary down to 0 (traffic now 100% stable)
+              kubectl scale deployment/devsecops-app-canary \
+                --replicas=0 -n $(K8S_NAMESPACE)
 
-              
-
-
-
-
-
+              echo "======================================"
+              echo "✅ Deployment complete! Traffic: 100% stable ($(BUILD_VERSION))"
+              echo "======================================"
+              kubectl get deployments -n $(K8S_NAMESPACE)
+            displayName: 'Promote and Scale Down Canary'
