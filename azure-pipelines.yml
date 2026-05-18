@@ -50,6 +50,41 @@ stages:
               publishLocation: 'Container'
             condition: always()
 
+          # Post summary to pipeline
+          - script: |
+              echo "##vso[task.logissue type=warning]SCA FINDINGS DETECTED - Review dependency vulnerabilities in artifact: sca-reports"
+              echo "##vso[task.complete result=SucceededWithIssues]SCA completed with findings"
+            displayName: 'Post SCA Warning'
+            continueOnError: true
+
+          # STAGE 2: SECRET SCAN
+          # Tool: Gitleaks + TruffleHog
+          # Purpose: Detect hardcoded secrets, API keys, credentials in code
+          # Findings expected: AWS keys, DB passwords, JWT secrets in app.js 
+
+  - stage: SecretScan
+    displayName: 'Stage 2 - Secret Scanning'
+    dependsOn: SCA
+    condition: always()
+    jobs:
+      - job: SecretDetection
+        displayName: 'Gitleaks + TruffleHog Secret Detection'
+        continueOnError: true
+        steps:
+        # Gitleaks - scans git history AND current code for secrets
+          - script: |
+              echo "======================================"
+              echo "Installing Gitleaks..."
+              echo "======================================"
+              gitleaks detect \
+                --source=$(Build.SourcesDirectory) \
+                --report-format=json \
+                --report-path=gitleaks-report.json \
+                --verbose || true
+
+
+
+
               
 
 
