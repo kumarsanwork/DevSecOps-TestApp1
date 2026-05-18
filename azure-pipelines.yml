@@ -9,11 +9,37 @@ trigger:
 pool:
   vmImage: ubuntu-latest
 
-steps:
-- script: echo Hello, world!
-  displayName: 'Run a one-line script'
+stages:
+  - stage: SCA
+    displayName: 'Stage 1 - SCA (Dependency Scanning)'
+    jobs:
+      - job: DependencyScan
+        displayName: 'OWASP Dependency Check + npm audit'
+        continueOnError: true
+        steps:
+          - task: UseNode@1
+            inputs:
+              checkLatest: true
 
-- script: |
-    echo Add other tasks to build, test, and deploy your project.
-    echo See https://aka.ms/yaml
-  displayName: 'Run a multi-line script'
+          - script: npm install
+            displayName: 'Install Dependencies'
+
+          # npm audit - built-in Node.js vulnerability scanner
+          - script: |
+              echo "======================================"
+              echo "Running npm audit..."
+              echo "======================================"
+              npm audit --json > npm-audit-report.json || true
+              npm audit || true
+              echo "npm audit complete. See report above."
+            displayName: 'npm audit'
+            continueOnError: true
+
+
+
+              
+
+
+
+
+
